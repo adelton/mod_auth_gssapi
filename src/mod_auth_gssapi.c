@@ -618,6 +618,199 @@ static bool use_s4u2proxy(struct mag_req_cfg *req_cfg) {
     }
     return false;
 }
+
+static apr_status_t mag_s4u2self(request_rec *req) {
+    apr_status_t status = DECLINED;
+    struct mag_config *cfg;
+    const char * phase;
+    gss_OID_set_desc gss_mech_krb5_set = { 1, discard_const(gss_mech_krb5) };
+    gss_OID_set actual_mechs = GSS_C_NO_OID_SET;
+    gss_buffer_desc principal = GSS_C_EMPTY_BUFFER;
+    gss_cred_id_t user_cred = GSS_C_NO_CREDENTIAL;
+    gss_name_t user = GSS_C_NO_NAME;
+    gss_name_t client_name = GSS_C_NO_NAME;
+    gss_buffer_desc client_display_name = GSS_C_EMPTY_BUFFER;
+    gss_cred_id_t server_cred = GSS_C_NO_CREDENTIAL;
+    gss_name_t server_name = GSS_C_NO_NAME;
+    gss_buffer_desc server_display_name = GSS_C_EMPTY_BUFFER;
+    gss_cred_id_t delegated_cred = GSS_C_NO_CREDENTIAL;
+    gss_ctx_id_t initiator_context = GSS_C_NO_CONTEXT;
+    gss_buffer_desc init_token = GSS_C_EMPTY_BUFFER;
+    gss_ctx_id_t acceptor_context = GSS_C_NO_CONTEXT;
+    gss_buffer_desc accept_token = GSS_C_EMPTY_BUFFER;
+    uint32_t maj, min;
+
+    cfg = ap_get_module_config(req->per_dir_config, &auth_gssapi_module);
+    if (!cfg->s4u2self_source) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
+                        "In S4U2Self no s4u2self_source set, skipping.");
+        return DECLINED;
+    }
+    if (strcmp(cfg->s4u2self_source, "r->user") == 0) {
+        principal.value = req->user;
+    } else {
+        principal.value = apr_pstrdup(req->pool,
+                apr_table_get(req->subprocess_env, cfg->s4u2self_source));
+    }
+
+    if (!principal.value) {
+        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, req,
+                "User not found authenticated in [%s], skipping S4U2Self.",
+                                                    cfg->s4u2self_source);
+        goto done_done;
+    }
+    principal.length = strlen(principal.value);
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
+                        "In S4U2Self using user [%s] from [%s].",
+                        (char *)principal.value, cfg->s4u2self_source);
+
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
+                        "In S4U2Self calling mag_acquire_creds() for server.");
+    if (!mag_acquire_creds(req, cfg, &gss_mech_krb5_set,
+                            GSS_C_BOTH, &server_cred, NULL)) {
+        goto done_done;
+    }
+
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
+                        "In S4U2Self calling gss_inquire_cred() for server.");
+    if ((maj = gss_inquire_cred(&min, server_cred, &server_name, NULL, NULL,
+        NULL))) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, req,
+                    "In S4U2Self for server cred, %s",
+                    mag_error(req, "gss_inquired_cred() failed", maj, min));
+        goto done_done;
+    }
+
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
+                        "In S4U2Self calling gss_display_name() for server.");
+    if ((maj = gss_display_name(&min, server_name, &server_display_name,
+        NULL))) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, req,
+                    "In S4U2Self for server cred, %s",
+                    mag_error(req, "gss_display_name() failed", maj, min));
+        goto done_done;
+    }
+
+    phase = "gss_import_name()";
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
+                        "In S4U2Self calling %s for [%s].",
+                        phase, (char *)principal.value);
+    if ((maj = gss_import_name(&min, &principal, GSS_C_NT_USER_NAME, &user))) {
+        goto done;
+    }
+
+    phase = "gss_acquire_cred_impersonate_name()";
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
+            "In S4U2Self calling %s for [%s] and [%s].", phase,
+            (char *)principal.value, (char *)server_display_name.value);
+    if ((maj = gss_acquire_cred_impersonate_name(&min,
+                server_cred, user, GSS_C_INDEFINITE, &gss_mech_krb5_set,
+                GSS_C_INITIATE, &user_cred, &actual_mechs, NULL))) {
+        goto done;
+    }
+
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
+                                    "In S4U2Self %s passed.", phase);
+
+    for (int i = 0; i < actual_mechs->count; i++) {
+        gss_release_buffer(&min, &accept_token);
+        gss_release_buffer(&min, &init_token);
+
+        do {
+            /* output and input are inverted here, this is intentional */
+
+            /* now acquire credentials for impersonated user to self */
+            phase = "gss_init_sec_context()";
+
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
+                "In S4U2Self calling %s for [%s] and [%s].", phase,
+                (char *)principal.value, (char *)server_display_name.value);
+            maj = gss_init_sec_context(&min, user_cred, &initiator_context,
+                    server_name, &actual_mechs->elements[i],
+                    GSS_C_REPLAY_FLAG | GSS_C_SEQUENCE_FLAG,
+                    GSS_C_INDEFINITE, GSS_C_NO_CHANNEL_BINDINGS,
+                    &accept_token, NULL, &init_token, NULL, NULL);
+            if (GSS_ERROR(maj)) {
+                goto done;
+            }
+            gss_release_buffer(&min, &accept_token);
+
+            /* accept context to be able to store delegated credentials */
+            phase = "gss_accept_sec_context()";
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
+                "In S4U2Self calling %s for [%s] and [%s].", phase,
+                (char *)principal.value, (char *)server_display_name.value);
+            maj = gss_accept_sec_context(&min, &acceptor_context,
+                    server_cred, &init_token, GSS_C_NO_CHANNEL_BINDINGS,
+                    &client_name, NULL, &accept_token, NULL, NULL,
+                    &delegated_cred);
+            if (GSS_ERROR(maj)) {
+                goto done;
+            }
+            gss_release_buffer(&min, &init_token);
+        } while (maj == GSS_S_CONTINUE_NEEDED);
+
+        if (maj == GSS_S_COMPLETE) {
+           break;
+       }
+
+       ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
+                "In S4U2Self another actual_mech for init + accept.");
+    }
+
+    phase = "gss_display_name()";
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
+            "In S4U2Self calling %s for client_name.", phase);
+    if ((maj = gss_display_name(&min, client_name, &client_display_name,
+        NULL))) {
+        goto done;
+    }
+
+    if (delegated_cred == GSS_C_NO_CREDENTIAL) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, req,
+            "In S4U2Self for [%s]/[%s] and [%s], "
+            "GSS_C_NO_CREDENTIAL received, "
+            "does %s have +ok_to_auth_as_delegate?",
+            (char *)principal.value, (char *)client_display_name.value,
+            (char *)server_display_name.value,
+            (char *)server_display_name.value);
+        goto done_done;
+    }
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
+            "In S4U2Self for [%s]/[%s] and [%s], delegated cred obtained.",
+            (char *)principal.value, (char *)client_display_name.value,
+            (char *)server_display_name.value);
+
+    // FIXME: This needs to be configurable ...
+    mag_store_deleg_creds(req, "/var/run/httpd/bob_test_out", delegated_cred);
+
+    status = OK;
+
+done:
+    if (status != OK) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, req,
+                    "In S4U2Self for [%s], %s", (char *)principal.value,
+                        mag_error(req, phase, maj, min));
+    }
+
+done_done:
+    gss_release_oid_set(&min, &actual_mechs);
+    principal.value = NULL;
+    gss_release_buffer(&min, &principal);
+    gss_release_cred(&min, &user_cred);
+    gss_release_name(&min, &user);
+    gss_release_name(&min, &client_name);
+    gss_release_buffer(&min, &client_display_name);
+    gss_release_cred(&min, &server_cred);
+    gss_release_name(&min, &server_name);
+    gss_release_buffer(&min, &server_display_name);
+    gss_release_cred(&min, &delegated_cred);
+    gss_delete_sec_context(&min, &initiator_context, GSS_C_NO_BUFFER);
+    gss_release_buffer(&min, &init_token);
+    gss_delete_sec_context(&min, &acceptor_context, GSS_C_NO_BUFFER);
+    gss_release_buffer(&min, &accept_token);
+    return status;
+}
 #endif
 
 static int mag_auth(request_rec *req)
@@ -1373,6 +1566,9 @@ static const command_rec mag_commands[] = {
                      OR_AUTHCFG, "Directory to store delegated credentials"),
     AP_INIT_FLAG("GssapiDelegCcacheUnique", mag_deleg_ccache_unique, NULL,
                  OR_AUTHCFG, "Use unique ccaches for delgation"),
+    AP_INIT_TAKE1("GssS4U2SelfFrom", ap_set_string_slot,
+          (void *)APR_OFFSETOF(struct mag_config, s4u2self_source), OR_AUTHCFG,
+               "Do S4U2Self call based on r->user or environment variable"),
 #endif
 #ifdef HAVE_GSS_ACQUIRE_CRED_WITH_PASSWORD
     AP_INIT_FLAG("GssapiBasicAuth", mag_use_basic_auth, NULL, OR_AUTHCFG,
@@ -1395,6 +1591,9 @@ mag_register_hooks(apr_pool_t *p)
     ap_hook_check_user_id(mag_auth, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_post_config(mag_post_config, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_pre_connection(mag_pre_connection, NULL, NULL, APR_HOOK_MIDDLE);
+#ifdef HAVE_CRED_STORE
+    ap_hook_fixups(mag_s4u2self, NULL, NULL, APR_HOOK_MIDDLE);
+#endif
 }
 
 module AP_MODULE_DECLARE_DATA auth_gssapi_module =

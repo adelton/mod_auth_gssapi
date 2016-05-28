@@ -71,6 +71,7 @@ struct mag_config {
     char *deleg_ccache_dir;
     gss_key_value_set_desc *cred_store;
     bool deleg_ccache_unique;;
+    char *s4u2self_source;
 #endif
     struct seal_key *mag_skey;
 
