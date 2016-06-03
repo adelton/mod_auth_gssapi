@@ -650,6 +650,7 @@ static bool use_s4u2proxy(struct mag_req_cfg *req_cfg) {
 static apr_status_t mag_s4u2self(request_rec *req) {
     apr_status_t status = DECLINED;
     struct mag_config *cfg;
+    struct mag_req_cfg *req_cfg;
     const char * phase;
     gss_OID_set_desc gss_mech_krb5_set = { 1, discard_const(gss_mech_krb5) };
     gss_OID_set actual_mechs = GSS_C_NO_OID_SET;
@@ -666,9 +667,11 @@ static apr_status_t mag_s4u2self(request_rec *req) {
     gss_buffer_desc init_token = GSS_C_EMPTY_BUFFER;
     gss_ctx_id_t acceptor_context = GSS_C_NO_CONTEXT;
     gss_buffer_desc accept_token = GSS_C_EMPTY_BUFFER;
+    struct mag_conn *mc = NULL;
     uint32_t maj, min;
 
-    cfg = ap_get_module_config(req->per_dir_config, &auth_gssapi_module);
+    req_cfg = mag_init_cfg(req);
+    cfg = req_cfg->cfg;
     if (!cfg->s4u2self) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
                       "GSSapiS4U2Self not On, skipping S4U2Self operation.");
@@ -780,8 +783,31 @@ static apr_status_t mag_s4u2self(request_rec *req) {
                   (char *)principal.value, (char *)server_display_name.value,
                   (char *)client_display_name.value);
 
-    // FIXME: This needs to be configurable ...
-    // mag_store_deleg_creds(req, "/var/run/httpd/bob_test_out", delegated_cred);
+    if (cfg->gss_conn_ctx) {
+        mc = (struct mag_conn *)ap_get_module_config(
+                                                req->connection->conn_config,
+                                                &auth_gssapi_module);
+        if (!mc) {
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
+                          "Failed to retrieve connection context!");
+            goto done;
+        }
+    }
+
+    /* if available, session always supersedes connection bound data */
+    if (req_cfg->use_sessions) {
+        mag_check_session(req_cfg, &mc);
+    }
+
+    if (!mc) {
+        /* no preserved mc, create one just for this request */
+        mc = mag_new_conn_ctx(req->pool);
+    }
+
+    mc->gss_name = apr_pstrndup(req->pool, client_display_name.value,
+                                client_display_name.length);
+
+    mag_store_deleg_creds(req, req_cfg, mc, delegated_cred);
 
     status = OK;
 
