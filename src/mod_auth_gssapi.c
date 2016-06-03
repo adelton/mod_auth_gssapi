@@ -641,145 +641,116 @@ static apr_status_t mag_s4u2self(request_rec *req) {
     uint32_t maj, min;
 
     cfg = ap_get_module_config(req->per_dir_config, &auth_gssapi_module);
-    if (!cfg->s4u2self_source) {
+    if (!cfg->s4u2self) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
-                        "In S4U2Self no s4u2self_source set, skipping.");
+                      "GSSapiS4U2Self not On, skipping S4U2Self operation.");
         return DECLINED;
     }
-    if (strcmp(cfg->s4u2self_source, "r->user") == 0) {
-        principal.value = req->user;
-    } else {
-        principal.value = apr_pstrdup(req->pool,
-                apr_table_get(req->subprocess_env, cfg->s4u2self_source));
+    if (!cfg->deleg_ccache_dir) {
+        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, req,
+                      "GssapiDelegCcacheDir not set, "
+                      "skipping S4U2Self operation.");
+        return DECLINED;
+    }
+    if (!req->user) {
+        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, req,
+                      "Authentication user not found, "
+                      "skipping S4U2Self operation.");
+        return DECLINED;
     }
 
-    if (!principal.value) {
-        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, req,
-                "User not found authenticated in [%s], skipping S4U2Self.",
-                                                    cfg->s4u2self_source);
-        goto done_done;
-    }
+    principal.value = req->user;
     principal.length = strlen(principal.value);
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
-                        "In S4U2Self using user [%s] from [%s].",
-                        (char *)principal.value, cfg->s4u2self_source);
+                  "Using user %s for S4U2Self operation.",
+                  (char *)principal.value);
 
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
-                        "In S4U2Self calling mag_acquire_creds() for server.");
     if (!mag_acquire_creds(req, cfg, &gss_mech_krb5_set,
-                            GSS_C_BOTH, &server_cred, NULL)) {
+                           GSS_C_BOTH, &server_cred, NULL)) {
         goto done_done;
     }
 
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
-                        "In S4U2Self calling gss_inquire_cred() for server.");
-    if ((maj = gss_inquire_cred(&min, server_cred, &server_name, NULL, NULL,
-        NULL))) {
+    maj = gss_inquire_cred(&min, server_cred, &server_name, NULL, NULL, NULL);
+    if (GSS_ERROR(maj)) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, req,
-                    "In S4U2Self for server cred, %s",
-                    mag_error(req, "gss_inquired_cred() failed", maj, min));
+                      mag_error(req,
+                      "gss_inquired_cred() failed to inquire server creds",
+                      maj, min));
         goto done_done;
     }
 
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
-                        "In S4U2Self calling gss_display_name() for server.");
-    if ((maj = gss_display_name(&min, server_name, &server_display_name,
-        NULL))) {
+    maj = gss_display_name(&min, server_name, &server_display_name, NULL);
+    if (GSS_ERROR(maj)) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, req,
-                    "In S4U2Self for server cred, %s",
-                    mag_error(req, "gss_display_name() failed", maj, min));
+                      mag_error(req,
+                      "gss_display_name() failed to export server name",
+                      maj, min));
         goto done_done;
     }
 
     phase = "gss_import_name()";
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
-                        "In S4U2Self calling %s for [%s].",
-                        phase, (char *)principal.value);
-    if ((maj = gss_import_name(&min, &principal, GSS_C_NT_USER_NAME, &user))) {
+    maj = gss_import_name(&min, &principal, GSS_C_NT_USER_NAME, &user);
+    if (GSS_ERROR(maj)) {
         goto done;
     }
 
     phase = "gss_acquire_cred_impersonate_name()";
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
-            "In S4U2Self calling %s for [%s] and [%s].", phase,
-            (char *)principal.value, (char *)server_display_name.value);
-    if ((maj = gss_acquire_cred_impersonate_name(&min,
-                server_cred, user, GSS_C_INDEFINITE, &gss_mech_krb5_set,
-                GSS_C_INITIATE, &user_cred, &actual_mechs, NULL))) {
+    maj = gss_acquire_cred_impersonate_name(&min, server_cred, user,
+                                            GSS_C_INDEFINITE,
+                                            &gss_mech_krb5_set,
+                                            GSS_C_INITIATE, &user_cred,
+                                            &actual_mechs, NULL);
+    if (GSS_ERROR(maj)) {
         goto done;
     }
 
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
-                                    "In S4U2Self %s passed.", phase);
+    do {
+        /* output and input are inverted here, this is intentional */
 
-    for (int i = 0; i < actual_mechs->count; i++) {
+        /* now acquire credentials for impersonated user to self */
+        phase = "gss_init_sec_context()";
+
+        maj = gss_init_sec_context(&min, user_cred, &initiator_context,
+                                   server_name, discard_const(gss_mech_krb5),
+                                   GSS_C_REPLAY_FLAG | GSS_C_SEQUENCE_FLAG,
+                                   GSS_C_INDEFINITE,
+                                   GSS_C_NO_CHANNEL_BINDINGS, &accept_token,
+                                   NULL, &init_token, NULL, NULL);
+        if (GSS_ERROR(maj)) {
+            goto done;
+        }
         gss_release_buffer(&min, &accept_token);
+
+        /* accept context to be able to store delegated credentials */
+        phase = "gss_accept_sec_context()";
+        maj = gss_accept_sec_context(&min, &acceptor_context, server_cred,
+                                     &init_token, GSS_C_NO_CHANNEL_BINDINGS,
+                                     &client_name, NULL, &accept_token,
+                                     NULL, NULL, &delegated_cred);
+        if (GSS_ERROR(maj)) {
+            goto done;
+        }
         gss_release_buffer(&min, &init_token);
-
-        do {
-            /* output and input are inverted here, this is intentional */
-
-            /* now acquire credentials for impersonated user to self */
-            phase = "gss_init_sec_context()";
-
-            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
-                "In S4U2Self calling %s for [%s] and [%s].", phase,
-                (char *)principal.value, (char *)server_display_name.value);
-            maj = gss_init_sec_context(&min, user_cred, &initiator_context,
-                    server_name, &actual_mechs->elements[i],
-                    GSS_C_REPLAY_FLAG | GSS_C_SEQUENCE_FLAG,
-                    GSS_C_INDEFINITE, GSS_C_NO_CHANNEL_BINDINGS,
-                    &accept_token, NULL, &init_token, NULL, NULL);
-            if (GSS_ERROR(maj)) {
-                goto done;
-            }
-            gss_release_buffer(&min, &accept_token);
-
-            /* accept context to be able to store delegated credentials */
-            phase = "gss_accept_sec_context()";
-            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
-                "In S4U2Self calling %s for [%s] and [%s].", phase,
-                (char *)principal.value, (char *)server_display_name.value);
-            maj = gss_accept_sec_context(&min, &acceptor_context,
-                    server_cred, &init_token, GSS_C_NO_CHANNEL_BINDINGS,
-                    &client_name, NULL, &accept_token, NULL, NULL,
-                    &delegated_cred);
-            if (GSS_ERROR(maj)) {
-                goto done;
-            }
-            gss_release_buffer(&min, &init_token);
-        } while (maj == GSS_S_CONTINUE_NEEDED);
-
-        if (maj == GSS_S_COMPLETE) {
-           break;
-       }
-
-       ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
-                "In S4U2Self another actual_mech for init + accept.");
-    }
+    } while (maj == GSS_S_CONTINUE_NEEDED);
 
     phase = "gss_display_name()";
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
-            "In S4U2Self calling %s for client_name.", phase);
-    if ((maj = gss_display_name(&min, client_name, &client_display_name,
-        NULL))) {
+    maj = gss_display_name(&min, client_name, &client_display_name, NULL);
+    if (GSS_ERROR(maj)) {
         goto done;
     }
 
     if (delegated_cred == GSS_C_NO_CREDENTIAL) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, req,
-            "In S4U2Self for [%s]/[%s] and [%s], "
-            "GSS_C_NO_CREDENTIAL received, "
-            "does %s have +ok_to_auth_as_delegate?",
-            (char *)principal.value, (char *)client_display_name.value,
-            (char *)server_display_name.value,
-            (char *)server_display_name.value);
+                      "Failed to obtain deletaged credentials for %s, "
+                      "does %s have +ok_to_auth_as_delegate?",
+                      (char *)client_display_name.value,
+                      (char *)server_display_name.value);
         goto done_done;
     }
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
-            "In S4U2Self for [%s]/[%s] and [%s], delegated cred obtained.",
-            (char *)principal.value, (char *)client_display_name.value,
-            (char *)server_display_name.value);
+                  "Delegated credentials obtained for %s by %s via %s.",
+                  (char *)principal.value, (char *)server_display_name.value,
+                  (char *)client_display_name.value);
 
     // FIXME: This needs to be configurable ...
     mag_store_deleg_creds(req, "/var/run/httpd/bob_test_out", delegated_cred);
@@ -789,8 +760,9 @@ static apr_status_t mag_s4u2self(request_rec *req) {
 done:
     if (status != OK) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, req,
-                    "In S4U2Self for [%s], %s", (char *)principal.value,
-                        mag_error(req, phase, maj, min));
+                      "mag_s4u2self for %s failed, %s",
+                      (char *)principal.value,
+                      mag_error(req, phase, maj, min));
     }
 
 done_done:
@@ -1566,9 +1538,9 @@ static const command_rec mag_commands[] = {
                      OR_AUTHCFG, "Directory to store delegated credentials"),
     AP_INIT_FLAG("GssapiDelegCcacheUnique", mag_deleg_ccache_unique, NULL,
                  OR_AUTHCFG, "Use unique ccaches for delgation"),
-    AP_INIT_TAKE1("GssS4U2SelfFrom", ap_set_string_slot,
-          (void *)APR_OFFSETOF(struct mag_config, s4u2self_source), OR_AUTHCFG,
-               "Do S4U2Self call based on r->user or environment variable"),
+    AP_INIT_FLAG("GssapiS4U2Self", ap_set_flag_slot,
+          (void *)APR_OFFSETOF(struct mag_config, s4u2self), OR_AUTHCFG,
+               "Do S4U2Self call based on already authentication username"),
 #endif
 #ifdef HAVE_GSS_ACQUIRE_CRED_WITH_PASSWORD
     AP_INIT_FLAG("GssapiBasicAuth", mag_use_basic_auth, NULL, OR_AUTHCFG,

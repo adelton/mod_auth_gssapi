@@ -306,21 +306,19 @@ Auth mechanism. Enable GssapiNegotiateOnce to avoid this situation.
 - **Enable with:** GssapiNegotiateOnce On
 - **Default:** GssapiNegotiateOnce Off
 
-### GssS4U2SelfFrom
+### GssapiS4U2Self
 
 This option can be used even if AuthType GSSAPI is not used for given
-Location or LocationMatch. It can be used to obtain service ticket
-for user that was already authenticated by different module.
+Location or LocationMatch, to obtain service ticket for user that was
+already authenticated by different module.
 
-The principal of the user can be retrieved either from internal r->user
-identifier which typically holds the username for authentication
-results, or environment variable name to use any environment variable
-which the other module might have populated.
+The principal of the user is retrieved either from the internal r->user
+identifier which typically holds the username from the authentication
+results.
 
 Make sure the server principal is set to allow to acquire forwardable
 tickets to itself from arbitrary users, for use with constrained
-delegation, for example with option +ok_to_auth_as_delegate.
+delegation, for example with the option +ok_to_auth_as_delegate.
 
-#### Example
-    GssS4U2SelfFrom "r->user"
-    GssS4U2SelfFrom "saml_KerbPrincipal"
+- **Enable with:** GssapiS4U2Self On
+- **Default:** GssapiS4U2Self Off
