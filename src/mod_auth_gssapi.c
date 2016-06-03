@@ -231,7 +231,7 @@ static char *get_ccache_name(request_rec *req, char *dir, const char *gss_name,
     return ccname;
 }
 
-static int mag_store_deleg_creds(request_rec *req,
+static bool mag_store_deleg_creds(request_rec *req,
                                   struct mag_req_cfg *req_cfg,
                                   struct mag_conn *mc,
                                   gss_cred_id_t delegated_cred)
@@ -246,17 +246,16 @@ static int mag_store_deleg_creds(request_rec *req,
     store.count = 1;
 
     mc->ccname = 0;
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
-                  "requester: %s", mc->gss_name);
-
     cfg = req_cfg->cfg;
     ccache_path = get_ccache_name(req, cfg->deleg_ccache_dir, mc->gss_name,
                                   cfg->deleg_ccache_unique, mc);
     if (ccache_path == NULL) {
-        return 0;
+        return false;
     }
 
     element.value = apr_psprintf(req->pool, "FILE:%s", ccache_path);
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, req,
+                  "Storing delegated credentials in %s", element.value);
 
     maj = gss_store_cred_into(&min, delegated_cred, GSS_C_INITIATE,
                               GSS_C_NULL_OID, 1, 1, &store, NULL, NULL);
@@ -277,7 +276,7 @@ static int mag_store_deleg_creds(request_rec *req,
 
     /* extract filename from full path */
     mc->ccname = strrchr(ccache_path, '/') + 1;
-    return 1;
+    return true;
 }
 #endif
 
